@@ -16,6 +16,14 @@ Path("scrapes").mkdir(exist_ok=True)
 Path("summaries").mkdir(exist_ok=True)
 HISTORY_FILE = Path("history.json")
 
+# Session state for follow-up persistence
+if "last_query" not in st.session_state:
+    st.session_state["last_query"] = None
+if "last_summary" not in st.session_state:
+    st.session_state["last_summary"] = None
+if "last_scrape" not in st.session_state:
+    st.session_state["last_scrape"] = None
+
 st.set_page_config(page_title="Smart Scraper Agent", layout="wide")
 st.title("🔍 Smart Scraper Agent")
 st.caption("Ask a question. GPT will scrape a website, export content, and summarize it.")
@@ -42,12 +50,7 @@ with st.expander("📜 Scrape History", expanded=False):
         st.write("No history yet.")
 
 def scrape_page(url: str) -> tuple[str, str]:
-    from datetime import datetime
-    from pathlib import Path
-    Path("scrapes").mkdir(exist_ok=True)
-
     profile_dir = "/tmp/playwright-profile"  # Persistent profile directory
-
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch_persistent_context(
@@ -65,24 +68,21 @@ def scrape_page(url: str) -> tuple[str, str]:
             page.mouse.wheel(0, 400)
             time.sleep(random.uniform(0.5, 1.5))
 
-            # Extract page text
             text = page.inner_text("body")[:5000]
             title = page.title()
 
-            # CAPTCHA/Login detection
-            #if any(term in text.lower() for term in ["captcha", "verify you are human", "sign in", "log in", "access denied"]):
-            #    st.warning("⚠️ CAPTCHA or login detected. Please complete it manually in the browser.")
-            #    page.pause()  # You interact, then resume
-            #    text = page.inner_text("body")[:5000]
-            #    title = page.title()
+            # CAPTCHA/Login detection (optional)
+            # if any(term in text.lower() for term in ["captcha", "verify you are human", "sign in", "log in", "access denied"]):
+            #     st.warning("⚠️ CAPTCHA or login detected. Please complete it manually in the browser.")
+            #     page.pause()
+            #     text = page.inner_text("body")[:5000]
+            #     title = page.title()
 
             browser.close()
-
         except Exception as e:
             browser.close()
             raise RuntimeError(f"Scraping failed or blocked: {str(e)}")
 
-    # Save to .txt file
     safe_title = "".join(c for c in title if c.isalnum() or c in " -_").rstrip()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"scrapes/{safe_title[:50] or 'scrape'}_{timestamp}.txt"
@@ -99,7 +99,6 @@ def save_summary_md(summary: str, query: str):
 
 if run_button and query:
     with st.spinner("Thinking..."):
-        # Step 1: GPT chooses a URL to scrape
         tools = [{
             "type": "function",
             "function": {
@@ -134,7 +133,6 @@ Do not attempt to answer the question directly. Only respond by calling the scra
             url = json.loads(tool_call.function.arguments).get("url", "https://example.com")
             st.write(f"🔗 URL chosen by GPT: {url}")
 
-            # Step 2: Scrape the content
             try:
                 scraped_text, filename = scrape_page(url)
                 st.success("Scraping complete ✅")
@@ -144,7 +142,6 @@ Do not attempt to answer the question directly. Only respond by calling the scra
                 st.error(str(e))
                 st.stop()
 
-            # Step 3: Sanitize the scrape
             clean_response = client.chat.completions.create(
                 model="gpt-4.1",
                 messages=[
@@ -154,7 +151,6 @@ Do not attempt to answer the question directly. Only respond by calling the scra
             )
             cleaned_text = clean_response.choices[0].message.content
 
-            # Step 4: Summarize based on tool_call OR fallback
             if tool_msg.tool_calls:
                 final_response = client.chat.completions.create(
                     model="gpt-4.1",
@@ -179,7 +175,6 @@ Do not attempt to answer the question directly. Only respond by calling the scra
             st.markdown("### 🧠 GPT Summary")
             st.markdown(summary)
 
-            # Step 5: Save summary + log history
             save_summary_md(summary, query)
             history.append({
                 "query": query,
@@ -191,24 +186,25 @@ Do not attempt to answer the question directly. Only respond by calling the scra
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
 
-            # Step 6: Follow-up Q&A
-            follow_up = st.text_input("Ask a follow-up question based on this scrape:")
-            if follow_up:
-                follow_response = client.chat.completions.create(
-                    model="gpt-4.1",
-                    messages=[
-                        {"role": "system", "content": "You are continuing a conversation based on a scraped page."},
-                        {"role": "user", "content": query},
-                        {"role": "assistant", "content": summary},
-                        {"role": "user", "content": follow_up}
-                    ]
-                )
-                st.markdown("### 💬 Follow-up Answer")
-                st.markdown(follow_response.choices[0].message.content)
+            # Persist for follow-up
+            st.session_state["last_query"] = query
+            st.session_state["last_summary"] = summary
+            st.session_state["last_scrape"] = scraped_text
         else:
             st.warning("⚠️ GPT did not return a tool call. Try rephrasing the question.")
 
-            except Exception as e:
-                st.error(f"Scrape failed: {str(e)}")
-        else:
-            st.warning("GPT did not call the scrape tool.")
+# Follow-up question support
+if st.session_state["last_summary"]:
+    follow_up = st.text_input("Ask a follow-up question based on your last scrape:")
+    if follow_up:
+        follow_response = client.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": "You are continuing a conversation based on a scraped page."},
+                {"role": "user", "content": st.session_state["last_query"]},
+                {"role": "assistant", "content": st.session_state["last_summary"]},
+                {"role": "user", "content": follow_up}
+            ]
+        )
+        st.markdown("### 💬 Follow-up Answer")
+        st.markdown(follow_response.choices[0].message.content)
